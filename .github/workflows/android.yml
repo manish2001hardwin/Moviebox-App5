@@ -1,0 +1,194 @@
+name: Build Android APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost /usr/local/lib/node_modules /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force || true
+          df -h /
+
+      - name: Rust (stable + Android target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Android NDK
+        id: ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r27c
+          link-to-sdk: true
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Test Rust bridge (host)
+        working-directory: rust-ffi
+        run: |
+          cargo test --lib --locked
+          rm -rf target
+
+      - name: Generate Android project files
+        working-directory: app
+        run: flutter create . --platforms=android --org com.melyqon --project-name moviebox
+
+      - name: Patch Android manifest, minSdk, NDK, network security config
+        run: |
+          mkdir -p app/android/app/src/main/res/xml
+          cp ci/xml/network_security_config.xml app/android/app/src/main/res/xml/network_security_config.xml
+          python3 - <<'PY'
+          import re, glob
+          p = 'app/android/app/src/main/AndroidManifest.xml'
+          s = open(p).read()
+          s = s.replace('<application', '<uses-permission android:name="android.permission.INTERNET"/>\n    <application', 1)
+          # Scoped to the app's own localhost DASH proxy only (see ci/xml/network_security_config.xml)
+          # instead of a blanket usesCleartextTraffic="true" that permitted plain HTTP to any host.
+          s = s.replace('<application', '<application android:networkSecurityConfig="@xml/network_security_config"', 1)
+          s = re.sub(r'android:label="[^"]*"', 'android:label="Melyqon Movies"', s, count=1)
+          open(p, 'w').write(s)
+          for g in glob.glob('app/android/app/build.gradle*'):
+              t = open(g).read()
+              t = t.replace('flutter.minSdkVersion', '24')
+              t = t.replace('flutter.ndkVersion', '"27.2.12479018"')
+              open(g, 'w').write(t)
+          PY
+
+      - name: Build Rust core for arm64 (Android)
+        working-directory: rust-ffi
+        env:
+          RUSTFLAGS: "-C link-arg=-Wl,-z,max-page-size=16384"
+        run: |
+          cargo install cargo-ndk --locked
+          cargo ndk -t arm64-v8a -P 24 -o ../app/android/app/src/main/jniLibs build --release
+          ls -lh ../app/android/app/src/main/jniLibs/arm64-v8a
+          rm -rf target
+          rm -rf ~/.cargo/registry ~/.cargo/git
+          df -h /
+
+      - name: Decode release signing key from secrets
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          if [ -z "$KEYSTORE_B64" ]; then
+            echo "::error title=Missing signing secret::ANDROID_KEYSTORE_BASE64 repo secret is not set. See ci/README.md for how to generate and add it. Refusing to build with no signing key (this used to silently commit a keystore to the repo, which is not safe)."
+            exit 1
+          fi
+          mkdir -p ~/.android
+          echo "$KEYSTORE_B64" | base64 -d > ~/.android/debug.keystore
+          # Sanity check: must be a real, openable keystore, not a truncated/garbled secret.
+          keytool -list -keystore ~/.android/debug.keystore -storepass android >/dev/null
+
+      - name: Build APK
+        working-directory: app
+        run: |
+          flutter pub get 2>&1 | tee ../build.log
+          set +e
+          flutter build apk --release --target-platform android-arm64 --no-shrink --build-number=${{ github.run_number }} 2>&1 | tee -a ../build.log
+          status=${PIPESTATUS[0]}
+          if [ $status -ne 0 ]; then
+            msg=$( (grep -nE "Error:|error •|e: |FAILURE|What went wrong|Because|Could not|Execution failed|not found|version solving" ../build.log | head -25; echo "-----LAST LINES-----"; tail -25 ../build.log) | sed 's/%/%25/g' | awk '{printf "%s%%0A", $0}')
+            echo "::error title=Build APK failed::$msg"
+          fi
+          exit $status
+
+      - name: Inspect APK (signature, SDK levels, native libs)
+        # Not continue-on-error: an APK that fails signature verification, or
+        # is missing its arm64 native library, must fail the build loudly
+        # rather than be uploaded as if it were fine.
+        run: |
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          APK=app/build/app/outputs/flutter-apk/app-release.apk
+          {
+            echo "--- badging"
+            "$BT/aapt2" dump badging "$APK" | grep -E "^package:|^sdkVersion|^targetSdkVersion|^native-code"
+            echo "--- signature"
+            "$BT/apksigner" verify --verbose --print-certs "$APK" 2>&1 | grep -E "Verifies|Verified using|Signer #1 certificate (DN|SHA-256)|WARNING|ERROR" | head -8
+            echo "--- native libs"
+            unzip -l "$APK" | grep -E "\.so$" | awk '{print $1, $4}'
+          } > inspect.txt 2>&1
+          cat inspect.txt
+          msg=$(sed 's/%/%25/g' inspect.txt | awk '{printf "%s%%0A", $0}')
+          echo "::notice title=APK inspection::$msg"
+
+          if ! "$BT/apksigner" verify "$APK" > /dev/null 2>&1; then
+            echo "::error title=APK signature verification failed::The built APK did not pass apksigner verify. Treating this as a build failure instead of uploading a bad APK."
+            exit 1
+          fi
+          if ! unzip -l "$APK" | grep -q "lib/arm64-v8a/libmoviebox_mobile.so"; then
+            echo "::error title=Missing native library::app-release.apk does not contain lib/arm64-v8a/libmoviebox_mobile.so - the Rust core would be missing at runtime."
+            exit 1
+          fi
+
+      - name: Upload pubspec.lock (commit this once for reproducible builds)
+        uses: actions/upload-artifact@v4
+        with:
+          name: pubspec-lock
+          path: app/pubspec.lock
+
+      - name: Upload APK (workflow artifact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: moviebox-arm64-apk
+          path: app/build/app/outputs/flutter-apk/app-release.apk
+
+      - name: Publish APK to GitHub Releases (latest)
+        continue-on-error: true
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: Latest build
+          files: app/build/app/outputs/flutter-apk/app-release.apk
+
+  install-test:
+    needs: apk
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        api: [34, 30]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: moviebox-arm64-apk
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Install + launch on Android emulator
+        uses: reactivecircus/android-emulator-runner@v2
+        env:
+          API: ${{ matrix.api }}
+        with:
+          api-level: ${{ matrix.api }}
+          target: google_apis
+          arch: x86_64
+          disable-animations: true
+          script: bash ci/install_test.sh

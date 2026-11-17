@@ -1,0 +1,12 @@
+target/
+rust-ffi/target/
+core/target/
+app/android/
+app/ios/
+app/build/
+app/.dart_tool/
+app/.flutter-plugins*
+app/.packages
+*.so
+ci/*.keystore
+ci/*.keystore.b64

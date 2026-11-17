@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Scoped cleartext (plain HTTP) exception: ONLY the app's own local DASH
+  proxy (rust-ffi/src/proxy.rs), which serves on http://127.0.0.1:<port>,
+  needs this. Every real network provider the app talks to is HTTPS.
+  Replaces a blanket android:usesCleartextTraffic="true" that previously
+  allowed plain HTTP to ANY host, which was broader than actually needed.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">127.0.0.1</domain>
+        <domain includeSubdomains="false">localhost</domain>
+    </domain-config>
+</network-security-config>
