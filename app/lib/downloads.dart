@@ -349,19 +349,26 @@ class Downloads extends ChangeNotifier {
   /// Drains and discards the body; this is only safe for the small,
   /// metadata-only purpose of comparing lengths.
   Future<int?> _verifyTrueLength(HttpClient client, DownloadTask t) async {
+    // Use HEAD, not GET: this is only a metadata check (does the server's
+    // current length match what we already have on disk?). Some providers
+    // issue single-use signed links, where a second GET can itself get
+    // rejected (observed as HTTP 429). HEAD asks for the same metadata
+    // without "spending" the link.
     try {
-      final req = await client.getUrl(Uri.parse(t.url));
+      final req = await client.headUrl(Uri.parse(t.url));
       t.headers.forEach((k, v) {
         try {
           req.headers.set(k, v);
         } catch (_) {}
       });
-      req.headers.set('Accept-Encoding', 'identity');
       final res = await req.close().timeout(const Duration(seconds: 15));
       final len = res.contentLength;
       await res.drain();
       return len > 0 ? len : null;
     } catch (_) {
+      // Some servers don't support HEAD at all (405/501) - in that case we
+      // simply can't verify, and the caller falls back to a full restart,
+      // which is the safe choice over trusting an unverifiable 416.
       return null;
     }
   }
